@@ -23,6 +23,7 @@ Use as a CLI:
 """
 
 import argparse
+import shlex
 import shutil
 import subprocess
 import sys
@@ -189,7 +190,7 @@ class ADB(_Tool):
         return self.shell(f"input swipe {x1} {y1} {x2} {y2} {ms}")
 
     def text(self, value: str) -> str:
-        return self.shell("input text " + value.replace(" ", "%s"))
+        return self.shell("input text " + shlex.quote(value))
 
     def keyevent(self, key: str) -> str:
         return self.shell(f"input keyevent {key}")
