@@ -28,7 +28,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 
 class ToolError(RuntimeError):
@@ -48,7 +48,7 @@ class _Tool:
         if platform_tools:
             candidate = Path(platform_tools) / self.binary
             for p in (candidate, candidate.with_suffix(".exe")):
-                if p.exists():
+                if p.is_file():
                     return str(p)
         found = shutil.which(self.binary)
         if not found:
@@ -64,26 +64,56 @@ class _Tool:
             cmd += ["-s", self.serial]
         return cmd
 
+    @staticmethod
+    def _format_cmd(cmd: Sequence[str]) -> str:
+        """Return a shell-escaped command suitable for diagnostic messages."""
+        return shlex.join([str(part) for part in cmd])
+
+    def _execute(
+        self, cmd: Sequence[str], timeout: Optional[int], capture_output: bool
+    ) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(
+                list(cmd),
+                capture_output=capture_output,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ToolError(f"Timed out after {timeout}s: {self._format_cmd(cmd)}") from exc
+        except OSError as exc:
+            raise ToolError(
+                f"Could not execute {self.binary}: {exc.strerror or exc}"
+            ) from exc
+
     def run(self, *args: str, timeout: Optional[int] = 120, check: bool = True) -> str:
         """Run a command and return combined stdout/stderr as text."""
-        cmd = self._base_cmd() + list(args)
-        try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout
-            )
-        except subprocess.TimeoutExpired:
-            raise ToolError(f"Timed out: {' '.join(cmd)}")
-        # fastboot writes most output to stderr, so merge both streams
-        output = (proc.stdout + proc.stderr).strip()
+        cmd = self._base_cmd() + [str(arg) for arg in args]
+        proc = self._execute(cmd, timeout, capture_output=True)
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        # fastboot writes most output to stderr, so merge both streams.
+        output = (stdout + stderr).strip()
         if check and proc.returncode != 0:
-            raise ToolError(f"Command failed ({proc.returncode}): {' '.join(cmd)}\n{output}")
+            detail = f"\n{output}" if output else ""
+            raise ToolError(
+                f"Command failed with exit code {proc.returncode}: "
+                f"{self._format_cmd(cmd)}{detail}"
+            )
         return output
 
     def stream(self, *args: str) -> int:
         """Run a command and stream its output live (Ctrl+C to stop)."""
-        cmd = self._base_cmd() + list(args)
+        cmd = self._base_cmd() + [str(arg) for arg in args]
         try:
             return subprocess.call(cmd)
+        except OSError as exc:
+            raise ToolError(
+                f"Could not execute {self.binary}: {exc.strerror or exc}"
+            ) from exc
         except KeyboardInterrupt:
             return 130
 
@@ -129,8 +159,8 @@ class ADB(_Tool):
         if third_party:
             args.append("-3")
         out = self.run(*args)
-        pkgs = [l.replace("package:", "") for l in out.splitlines() if l.startswith("package:")]
-        return [p for p in pkgs if filter_text in p]
+        pkgs = [line.removeprefix("package:") for line in out.splitlines() if line.startswith("package:")]
+        return [pkg for pkg in pkgs if filter_text in pkg]
 
     def push(self, local: str, remote: str) -> str:
         return self.run("push", local, remote, timeout=None)
@@ -140,10 +170,17 @@ class ADB(_Tool):
 
     def screenshot(self, out_path: str = "screenshot.png") -> str:
         cmd = self._base_cmd() + ["exec-out", "screencap", "-p"]
-        proc = subprocess.run(cmd, capture_output=True, timeout=60)
+        proc = self._execute(cmd, timeout=60, capture_output=True)
         if proc.returncode != 0:
-            raise ToolError(proc.stderr.decode(errors="replace"))
-        Path(out_path).write_bytes(proc.stdout)
+            error = (proc.stderr or proc.stdout or "screenshot failed").strip()
+            raise ToolError(
+                f"Command failed with exit code {proc.returncode}: "
+                f"{self._format_cmd(cmd)}\n{error}"
+            )
+        try:
+            Path(out_path).write_bytes((proc.stdout or "").encode("latin-1"))
+        except OSError as exc:
+            raise ToolError(f"Could not write screenshot '{out_path}': {exc}") from exc
         return out_path
 
     def logcat(self, *extra: str) -> int:
@@ -172,7 +209,7 @@ class ADB(_Tool):
             "build": "ro.build.display.id",
             "abi": "ro.product.cpu.abi",
         }
-        return {k: self.get_prop(v) for k, v in props.items()}
+        return {key: self.get_prop(value) for key, value in props.items()}
 
     def tcpip(self, port: int = 5555) -> str:
         return self.run("tcpip", str(port))
@@ -201,7 +238,7 @@ class Fastboot(_Tool):
 
     def devices(self) -> List[str]:
         out = self.run("devices")
-        return [l for l in out.splitlines() if l.strip()]
+        return [line for line in out.splitlines() if line.strip()]
 
     def getvar(self, name: str = "all") -> str:
         return self.run("getvar", name)
@@ -264,8 +301,7 @@ def build_parser() -> argparse.ArgumentParser:
     sc = a.add_parser("screenshot"); sc.add_argument("out", nargs="?", default="screenshot.png")
     lc = a.add_parser("logcat"); lc.add_argument("args", nargs="*")
     rb = a.add_parser("reboot")
-    rb.add_argument("mode", nargs="?", default="",
-                    choices=["", "bootloader", "recovery", "sideload", "fastboot"])
+    rb.add_argument("mode", nargs="?", default="", choices=["", "bootloader", "recovery", "sideload", "fastboot"])
     sl = a.add_parser("sideload"); sl.add_argument("zip")
     co = a.add_parser("connect"); co.add_argument("host", help="ip:port")
     a.add_parser("tcpip")
@@ -292,11 +328,9 @@ def main() -> int:
         if args.tool == "adb":
             t = ADB(args.serial, args.platform_tools)
             c = args.cmd
-            if c == "devices":
-                print("\n".join(t.devices()) or "No devices found.")
+            if c == "devices": print("\n".join(t.devices()) or "No devices found.")
             elif c == "info":
-                for k, v in t.device_info().items():
-                    print(f"{k:16}{v}")
+                for k, v in t.device_info().items(): print(f"{k:16}{v}")
             elif c == "start-server": print(t.start_server())
             elif c == "kill-server": print(t.kill_server())
             elif c == "shell": print(t.shell(args.command))
@@ -314,8 +348,7 @@ def main() -> int:
         else:
             t = Fastboot(args.serial, args.platform_tools)
             c = args.cmd
-            if c == "devices":
-                print("\n".join(t.devices()) or "No devices found.")
+            if c == "devices": print("\n".join(t.devices()) or "No devices found.")
             elif c == "getvar": print(t.getvar(args.name))
             elif c == "flash":
                 _confirm(f"Flashing '{args.partition}' overwrites it and can brick your device if wrong.")
